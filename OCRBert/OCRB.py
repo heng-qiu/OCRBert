@@ -8,26 +8,53 @@ class TokenEmbedding(nn.Embedding):
     def __init__(self, vocab_size, embed_size=512):
         super().__init__(vocab_size, embed_size, padding_idx=0)
         
-class PositionalEmbedding(nn.Module):
+# class PositionalEmbedding(nn.Module):
 
+#     def __init__(self, d_model, max_len=512):
+#         super().__init__()
+
+#         # Compute the positional encodings once in log space.
+#         pe = torch.zeros(max_len, d_model).float()
+#         pe.require_grad = False
+
+#         position = torch.arange(0, max_len).float().unsqueeze(1)
+#         div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
+
+#         pe[:, 0::2] = torch.sin(position * div_term)
+#         pe[:, 1::2] = torch.cos(position * div_term)
+
+#         pe = pe.unsqueeze(0)
+#         self.register_buffer('pe', pe)
+
+#     def forward(self, x):
+#         return self.pe[:, :x.size(1)]
+
+class PositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=512):
         super().__init__()
-
+        self.linear = nn.Linear(2*d_model, d_model)
+        
         # Compute the positional encodings once in log space.
-        pe = torch.zeros(max_len, d_model).float()
-        pe.require_grad = False
-
-        position = torch.arange(0, max_len).float().unsqueeze(1)
+        pe_start = torch.zeros(max_len, d_model).float()
+        pe_start.require_grad = False
+        pe_end = torch.zeros(max_len, d_model).float()
+        pe_end.require_grad = False
         div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
+        self.register_buffer('pe_start', pe_start)
+        self.register_buffer('pe_end', pe_end)
+        self.register_buffer('div_term', div_term)
 
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
+    def forward(self, positions):
+        # positions = torch.from_numpy(positions)
+        start = positions[:,0].float().unsqueeze(1)
+        end = positions[:,1].float().unsqueeze(1)
+        self.pe_start[:positions.size(0),:][:, 0::2] = torch.sin(start * self.div_term)
+        self.pe_start[:positions.size(0),:][:, 1::2] = torch.cos(start * self.div_term)
+        self.pe_end[:positions.size(0),:][:, 0::2] = torch.sin(end * self.div_term)
+        self.pe_end[:positions.size(0),:][:, 1::2] = torch.cos(end * self.div_term)
+        pe=torch.cat((self.pe_start[:positions.size(0),:], self.pe_end[:positions.size(0),:]), dim=1)
         pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        return self.pe[:, :x.size(1)]
+        return self.linear(pe)
 
 class OCRBEmbedding(nn.Module):
 
@@ -43,10 +70,14 @@ class OCRBEmbedding(nn.Module):
         # self.segment = SegmentEmbedding(embed_size=self.token.embedding_dim)
         self.dropout = nn.Dropout(p=dropout)
         self.embed_size = embed_size
-
-    def forward(self, sequence):
-        x = self.token(sequence) + self.position(sequence)
+        self.linear = nn.Linear(2*embed_size, embed_size)
+        
+    def forward(self, sequence, positions):
+        x = self.token(sequence) + self.position(positions)
         return self.dropout(x)
+        # x = torch.cat((self.token(sequence), self.position(positions).expand(self.token(sequence).size())), dim=-1)
+        # return self.dropout(self.linear(x))
+
     
 class Attention(nn.Module):
     """
@@ -114,8 +145,25 @@ class LayerNorm(nn.Module):
 
     def forward(self, x):
         mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
+        std = x.std(-1,unbiased=True, keepdim=True)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+class LogNormalization(nn.Module):
+    def __init__(self, c=1):
+        super(LogNormalization, self).__init__()
+        self.c = c
+
+    def forward(self, x):
+        return torch.log(x + self.c)
+
+class GaussianNormalization(nn.Module):
+    def __init__(self):
+        super(GaussianNormalization, self).__init__()
+
+    def forward(self, x):
+        mean = torch.mean(x, dim=0, keepdim=True)
+        std = torch.std(x, dim=0, keepdim=True)
+        return (x - mean) / (std + 1e-8)
 
 class GELU(nn.Module):
     """
@@ -129,20 +177,31 @@ class SublayerConnection(nn.Module):
     """
     A residual connection followed by a layer norm.
     Note for code simplicity the norm is first as opposed to last.
+    
+    formula:
+            LayerNorm(X+ Multi-Head Attention(X))
+            LayerNorm(X+ Feed Forward(X))
     """
 
     def __init__(self, size, dropout):
         super(SublayerConnection, self).__init__()
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
-
+        # self.norm = GaussianNormalization()
+        # self.norm = LogNormalization()
+        
     def forward(self, x, sublayer):
         "Apply residual connection to any sublayer with the same size."
-        output = sublayer(self.norm(x))
+        output = sublayer(x)
         if isinstance(output, tuple):
-            return x + self.dropout(output[0]), output[1]
+            return self.norm(x + self.dropout(output[0])), output[1]
         else:
-            return x + self.dropout(output)
+            return self.norm(x + self.dropout(output))
+        # output = sublayer(self.norm(x))
+        # if isinstance(output, tuple):
+        #     return x + self.dropout(output[0]), output[1]
+        # else:
+        #     return x + self.dropout(output)
 
 class PositionwiseFeedForward(nn.Module):
     "Implements FFN equation."
@@ -178,19 +237,33 @@ class TransformerBlock(nn.Module):
         self.input_sublayer = SublayerConnection(size=hidden, dropout=dropout)
         self.output_sublayer = SublayerConnection(size=hidden, dropout=dropout)
         self.dropout = nn.Dropout(p=dropout)
+        
 
     def forward(self, x, mask):
         x, weights = self.input_sublayer(x, lambda _x: self.attention.forward(_x, _x, _x, mask=mask))
         x = self.output_sublayer(x, self.feed_forward)
         return self.dropout(x), weights
     
+def _init_ocrb_weights(m):
+    """
+    ViT weight initialization
+    :param m: module
+    """
+    if isinstance(m, nn.Linear):
+        nn.init.trunc_normal_(m.weight, std=.01)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.zeros_(m.bias)
+        nn.init.ones_(m.weight) 
+
 ## 整个模型
 class OCRB(nn.Module):
     """
     OCRB model : Open Chromatin Regions in BERT model.
     """
 
-    def __init__(self, vocab_size, hidden=48, n_layers=4, attn_heads=6, dropout=0.1):
+    def __init__(self, vocab_size, hidden=48, n_layers=4, attn_heads=4, dropout=0.1):
         """
         :param vocab_size: vocab_size of total words
         :param hidden: BERT model hidden size
@@ -214,27 +287,41 @@ class OCRB(nn.Module):
         self.transformer_blocks = nn.ModuleList(
             [TransformerBlock(self.hidden, self.attn_heads, self.hidden * 4, self.dropout) for _ in range(n_layers)])
 
-    def forward(self, x):
+        self.apply(_init_ocrb_weights)
+
+    def forward(self, x, positions):
         # attention masking for padded token
         # torch.ByteTensor([batch_size, 1, seq_len, seq_len)
+        # EM = x>0
         mask = (x > 0).unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
 
-        # embedding the indexed sequence to sequence of vectors
-        # x = self.embedding(x, segment_info)
-        x = self.embedding(x)
+
+        x = self.embedding(x,positions)
+        # x = x*EM.unsqueeze(-1).float()
         
-        # attn_weights = []
-        # # running over multiple transformer blocks
-        # for transformer in self.transformer_blocks:
-        #     x, weights = transformer.forward(x, mask)
-        #     attn_weights.append(weights)
-        # return x
+        # # weights = []
+        # for i, transformer in enumerate(self.transformer_blocks):
+        #     x, weights = transformer(x, mask)
+        #     x = x*EM.unsqueeze(-1).float()
+        #     if i == self.n_layers - 1:
+        #         weights=torch.mean(weights, dim=1)
+        # return x, weights
         
+        weights = []
         for i, transformer in enumerate(self.transformer_blocks):
-            x, weights = transformer(x, mask)
+            x, weight = transformer(x, mask)
+            # x = x*EM.unsqueeze(-1).float()
+            weights.append(torch.mean(weight, dim=1))
             if i == self.n_layers - 1:
-                weights=torch.mean(weights, dim=1)
+                weights=torch.mean(torch.stack(weights, dim=0),dim=0)
+                break
         return x, weights
+        
+        # for i, transformer in enumerate(self.transformer_blocks):
+        #     x, weights = transformer(x, mask)
+        #     if i == self.n_layers - 1:
+        #         weights=torch.mean(weights, dim=1)
+        # return x, weights
     
 
 ## 重构
@@ -273,6 +360,6 @@ class OCRBLM(nn.Module):
         # self.next_sentence = NextSentencePrediction(self.bert.hidden)
         self.mask_lm = MaskedLanguageModel(self.ocrb.hidden, vocab_size)
 
-    def forward(self, x):
-        x, weights = self.ocrb(x)
+    def forward(self, x, positions):
+        x, weights = self.ocrb(x,positions)
         return self.mask_lm(x), weights

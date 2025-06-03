@@ -44,9 +44,10 @@ class ScheduledOptim():
             
             
 class OCRBTrainer:
-    def __init__(self, vocab_size: int, 
+    def __init__(self, vocab_size: int, positions,
                  train_dataloader: DataLoader, test_dataloader: DataLoader = None,
-                 lr: float = 1e-4, betas=(0.9, 0.999), weight_decay: float = 0.01, warmup_steps=10000,
+                 hidden=24, 
+                 lr: float = 1e-4, betas=(0.9, 0.999), weight_decay: float = 0.0001, warmup_steps=10000,
                  with_cuda: bool = True, cuda_devices=None, log_freq: int = 20):
         """
         :param OCRB: OCRB model which you want to train
@@ -66,9 +67,10 @@ class OCRBTrainer:
             self.device = torch.device(cuda_devices)
         else:
             self.device = torch.device("cuda:0" if cuda_condition else "cpu")
-
+        self.hidden = hidden
+        self.positions = torch.from_numpy(positions).to(self.device)
         # This OCRB model will be saved every epoch
-        self.OCRB = OCRB(vocab_size)
+        self.OCRB = OCRB(vocab_size,hidden=hidden)
         # Initialize the OCRB Language Model, with OCRB model
         self.model = OCRBLM(self.OCRB, vocab_size).to(self.device)
 
@@ -135,7 +137,7 @@ class OCRBTrainer:
             # mask_loss = self.criterion(mask_lm_output.transpose(1, 2), data["ocrb_label"])
             label=torch.squeeze(data['ocrb_label'], dim=1).to(self.device).detach()
             
-            mask_lm_output, _ = self.model.forward(inputs)
+            mask_lm_output, _ = self.model.forward(inputs,self.positions)
             loss = self.criterion(mask_lm_output.transpose(1, 2), label)
 
             # 3. backward and optimization only in train
@@ -179,12 +181,186 @@ class OCRBTrainer:
         return output_path
     
     @torch.no_grad()
-    def get_results(self, data_loader: DataLoader):
+    def get_results(self, data_loader: DataLoader,positions):
+        outputs = [] 
+        for data in tqdm(data_loader):
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            inputs=inputs.to('cuda:1')
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            outputs.append(output.cpu())
+        return torch.cat(outputs, dim=0)
+    
+    @torch.no_grad()
+    def get_all_embed(self, data_loader: DataLoader,positions,gene_pos):
+        output_gene = []
+        output_mean = [] 
+        output_w = []
+        output_bw = []
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            output_gene.append(torch.squeeze(output[:,gene_pos,:], dim=1))
+            # binary_tensor = (inputs[:, gene_pos] != 0).to(torch.float32)
+            output_mean.append(torch.mean(output, dim=1))
+            binary_tensor = (inputs!= 0).to(torch.float32)
+            output_w.append(torch.mean(output*torch.unsqueeze(inputs, dim=-1),dim=1))
+            output_bw.append(torch.mean(output*torch.unsqueeze(binary_tensor, dim=-1),dim=1))
+            
+        return torch.cat(output_gene, dim=0), torch.cat(output_mean, dim=0), torch.cat(output_w, dim=0),torch.cat(output_bw, dim=0)
+   
+    # @torch.no_grad()
+    # def get_all_embed(self, data_loader: DataLoader,positions,gene_pos):
+    #     output_gene = []
+    #     output_exp = [] 
+    #     output_weight = []
+    #     output_mean = []
+    #     for data in tqdm(data_loader):
+    #         inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+    #         # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+    #         # inputs=inputs.to('cuda:1')
+    #         output, _ = self.model.ocrb.forward(inputs,positions)
+    #         output_gene.append(torch.squeeze(output[:,gene_pos,:], dim=1))
+    #         output_weight.append(torch.squeeze(output[:,gene_pos,:], dim=1)*torch.unsqueeze(inputs[:, gene_pos], dim=1))
+    #         binary_tensor = (inputs[:, gene_pos] != 0).to(torch.float32)
+    #         output_exp.append(torch.squeeze(output[:,gene_pos,:], dim=1)*torch.unsqueeze(binary_tensor, dim=1))
+    #         # output_weight.append(torch.sum(output*torch.unsqueeze(inputs, dim=-1),dim=1))
+    #         output_mean.append(torch.mean(output*torch.unsqueeze(inputs, dim=-1),dim=1))
+    #     return torch.cat(output_gene, dim=0) ,torch.cat(output_weight, dim=0),torch.cat(output_exp, dim=0),torch.cat(output_mean, dim=0)
+    
+    
+    
+    @torch.no_grad()
+    def get_gene_embed(self, data_loader: DataLoader,positions,gene_pos):
         outputs = [] 
         for data in tqdm(data_loader):
             inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
-            output, _ = self.model.forward(inputs)
-            outputs.append(torch.argmax(output, dim=-1))
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            gene_embedding=torch.squeeze(output[:,gene_pos,:], dim=1)
+            # gene_embedding=output[:,gene_pos,:]
+            outputs.append(gene_embedding)
+        return torch.cat(outputs, dim=0) 
+
+    @torch.no_grad()
+    def FE(self, data_loader: DataLoader,positions,gene_pos):
+        output_gene = [] 
+        output_exp = [] 
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            output_gene.append(torch.squeeze(output[:,gene_pos,:], dim=1))
+            
+            binary_tensor = (inputs[:, gene_pos] != 0).to(torch.float32)
+            output_exp.append(torch.squeeze(output[:,gene_pos,:], dim=1)*torch.unsqueeze(binary_tensor, dim=1))
+        return torch.cat(output_gene, dim=0) ,torch.cat(output_exp, dim=0)
+    
+    @torch.no_grad()
+    def get_attn(self, data_loader: DataLoader,positions,gene_pos):
+        attn_weights = []
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            _, attn = self.model.ocrb.forward(inputs,positions)
+            attn_weights.append(attn)
+        return torch.cat(attn_weights, dim=0)
+    
+    @torch.no_grad()
+    def get_gene_embed2(self, data_loader: DataLoader,positions,gene_pos):
+        outputs = [] 
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            output, _ = self.OCRB(inputs,positions)
+            gene_embedding=torch.squeeze(output[:,gene_pos,:], dim=1)
+            # gene_embedding=output[:,gene_pos,:]
+            outputs.append(gene_embedding)
+        return torch.cat(outputs, dim=0) 
+
+    @torch.no_grad()
+    def get_embed(self, data_loader: DataLoader,positions,gene_pos):
+        outputs = [] 
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            gene_embedding=torch.squeeze(output[:,gene_pos,:], dim=1)*torch.unsqueeze(inputs[:, gene_pos], dim=1)
+            # gene_embedding=output[:,gene_pos,:]
+            outputs.append(gene_embedding)
+        return torch.cat(outputs, dim=0) 
+    
+    @torch.no_grad()
+    def get_joint_embed(self, data_loader: DataLoader,positions,gene_pos):
+        outputs = [] 
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            gene_embedding=torch.mean(output, dim=1)*torch.unsqueeze(inputs[:, gene_pos], dim=1)
+            # gene_embedding=output[:,gene_pos,:]
+            outputs.append(gene_embedding)
+        return torch.cat(outputs, dim=0) 
+    
+    @torch.no_grad()
+    def get_mean_embed(self, data_loader: DataLoader,positions):
+        outputs = [] 
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            gene_embedding=torch.mean(output, dim=1)
+            # gene_embedding=output[:,gene_pos,:]
+            outputs.append(gene_embedding)
+        return torch.cat(outputs, dim=0) 
+    
+    @torch.no_grad()
+    def get_weighted_embed(self, data_loader: DataLoader,positions):
+        outputs = [] 
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            # gene_embedding=torch.mean(output, dim=1)*torch.unsqueeze(inputs[:, gene_pos], dim=1)
+            gene_embedding=torch.sum(output*torch.unsqueeze(inputs, dim=-1),dim=1)
+            # gene_embedding=output[:,gene_pos,:]
+            outputs.append(gene_embedding)
+        return torch.cat(outputs, dim=0)
+    
+    @torch.no_grad()
+    def get_mean_weighted_embed(self, data_loader: DataLoader,positions):
+        outputs = [] 
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            # gene_embedding=torch.mean(output, dim=1)*torch.unsqueeze(inputs[:, gene_pos], dim=1)
+            gene_embedding=torch.mean(output*torch.unsqueeze(inputs, dim=-1),dim=1)
+            # gene_embedding=output[:,gene_pos,:]
+            outputs.append(gene_embedding)
+        return torch.cat(outputs, dim=0)
+    
+    @torch.no_grad()
+    def get_mean_weighted_embed(self, data_loader: DataLoader,positions):
+        outputs = [] 
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
+            # inputs=inputs.to('cuda:1')
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            # gene_embedding=torch.mean(output, dim=1)*torch.unsqueeze(inputs[:, gene_pos], dim=1)
+            gene_embedding=torch.mean(output*torch.unsqueeze(inputs, dim=-1),dim=1)
+            # gene_embedding=output[:,gene_pos,:]
+            outputs.append(gene_embedding)
         return torch.cat(outputs, dim=0)
     
     def test_result(self):
@@ -200,3 +376,21 @@ class OCRBTrainer:
             _, attn = self.model.ocrb(torch.squeeze(batch['ocrb_input'], dim=1).to(self.device))
             attn_weights.append(attn.cpu())
         return torch.cat(attn_weights, dim=0)
+    
+    @torch.no_grad()
+    def get_w_embed(self, data_loader: DataLoader,gene_pos,positions):
+        outputs_1= [] 
+        outputs_2= [] 
+        outputs_3= []
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            output, _ = self.model.ocrb.forward(inputs,positions)
+            gene_embedding=torch.squeeze(output[:,gene_pos,:], dim=1)*torch.unsqueeze(inputs[:, gene_pos], dim=1)
+            outputs_1.append(gene_embedding)
+            gene_embedding_2 = gene_embedding + torch.squeeze(output[:,gene_pos,:], dim=1)
+            gaa_embedding=torch.mean(output*torch.unsqueeze(inputs, dim=-1)+output, dim=1)
+            outputs_2.append(gaa_embedding)
+            outputs_3.append(gene_embedding_2)
+        return torch.cat(outputs_1, dim=0),torch.cat(outputs_2, dim=0),torch.cat(outputs_3, dim=0)
+    
+    
