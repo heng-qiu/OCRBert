@@ -1,1 +1,1 @@
-from .train import OCRBTrainer
+from .train import OCRBTrainer, OCRBDataset

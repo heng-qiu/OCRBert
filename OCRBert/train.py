@@ -2,13 +2,59 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.utils.data import DataLoader
-
+from torch.utils.data import Dataset, DataLoader
+from sklearn.decomposition import PCA
 from .OCRB import OCRBLM,OCRB
 from tqdm import tqdm
 
 # import os
 # os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+def mask_tokens(inputs, vocab, mask_id, prob=0.15):
+    """ 准备掩码语言模型的掩码输入和标签：
+        80% 为 MASK,10% 为随机,10% 保留原值。
+        只对非零值进行掩码。
+    """
+    labels = inputs.clone()
+
+    # 只对非零值进行掩码
+    non_zero_indices = inputs != 0  # 判断哪些位置的值不为零
+    masked_indices = torch.bernoulli(torch.full(labels.shape, prob)).bool() & non_zero_indices
+
+    # 对于没有被掩码的位置，标签设为 -1（不做掩码）
+    labels[~masked_indices] = -1  
+    
+    # 80% 的掩码位置，用 MASK 代替
+    indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
+    inputs[indices_replaced] = mask_id
+
+    # 10% 的掩码位置，替换为随机词
+    indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
+    random_words = torch.randint(len(vocab), labels.shape, dtype=torch.long)  # 确保随机词在词汇表范围内
+    inputs[indices_random] = random_words[indices_random]
+
+    # 剩下的 10% 保持原始词不变，由 `labels` 处理
+    return inputs, labels
+
+class OCRBDataset(Dataset):
+    def __init__(self, data, vocab=None, mask_id=None, prob=None):
+        self.data = data
+        self.vocab = vocab
+        self.mask_id = mask_id
+        self.prob=prob
+    
+    def __len__(self):
+        return self.data.shape[0]
+    
+    def __getitem__(self, item):
+        if self.vocab is not None and self.mask_id is not None:
+            inputs,label = mask_tokens(torch.from_numpy(self.data[item].toarray().astype(int)), self.vocab, self.mask_id)
+        else:
+            inputs=torch.from_numpy(self.data[item].toarray().astype(int))
+            label=inputs.clone()
+        output = {"ocrb_input": inputs,
+                  "ocrb_label": label}
+        # return {key: torch.tensor(value) for key, value in output.items()}
+        return output
 
 class ScheduledOptim():
     '''A simple wrapper class for learning rate scheduling'''
@@ -234,19 +280,6 @@ class OCRBTrainer:
     
     @torch.no_grad()
     def get_gene_embed(self, data_loader: DataLoader,positions,gene_pos):
-        outputs = [] 
-        for data in tqdm(data_loader):
-            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
-            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
-            # inputs=inputs.to('cuda:1')
-            output, _ = self.model.ocrb.forward(inputs,positions)
-            gene_embedding=torch.squeeze(output[:,gene_pos,:], dim=1)
-            # gene_embedding=output[:,gene_pos,:]
-            outputs.append(gene_embedding)
-        return torch.cat(outputs, dim=0) 
-
-    @torch.no_grad()
-    def FE(self, data_loader: DataLoader,positions,gene_pos):
         output_gene = [] 
         output_exp = [] 
         for data in tqdm(data_loader):
@@ -257,14 +290,25 @@ class OCRBTrainer:
             binary_tensor = (inputs[:, gene_pos] != 0).to(torch.float32)
             output_exp.append(torch.squeeze(output[:,gene_pos,:], dim=1)*torch.unsqueeze(binary_tensor, dim=1))
         return torch.cat(output_gene, dim=0) ,torch.cat(output_exp, dim=0)
+
+    @torch.no_grad()
+    def FE(self, data_loader: DataLoader,positions,gene_pos):
+        output_exp = [] 
+        pca = PCA(n_components=1)
+        for data in tqdm(data_loader):
+            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
+            output, _ = self.model.ocrb.forward(inputs,positions) 
+            binary_tensor = (inputs[:, gene_pos] != 0).to(torch.float32)
+            output_exp.append(torch.squeeze(output[:,gene_pos,:], dim=1)*torch.unsqueeze(binary_tensor, dim=1))
+        embeds=torch.cat(output_exp, dim=0)
+        w= pca.fit_transform(embeds.cpu().numpy())
+        return w
     
     @torch.no_grad()
     def get_attn(self, data_loader: DataLoader,positions):
         attn_weights = []
         for data in tqdm(data_loader):
             inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
-            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
-            # inputs=inputs.to('cuda:1')
             _, attn = self.model.ocrb.forward(inputs,positions)
             attn_weights.append(attn)
         return torch.cat(attn_weights, dim=0)
@@ -279,18 +323,7 @@ class OCRBTrainer:
     #         _, attn = self.model.ocrb.forward(inputs,positions)
     #         attn_weights.append(attn)
     #     return torch.cat(attn_weights, dim=0)
-    @torch.no_grad()
-    def get_gene_embed2(self, data_loader: DataLoader,positions,gene_pos):
-        outputs = [] 
-        for data in tqdm(data_loader):
-            inputs=torch.squeeze(data['ocrb_input'], dim=1).to(self.device)    
-            # inputs=torch.squeeze(data['ocrb_input'], dim=1)
-            # inputs=inputs.to('cuda:1')
-            output, _ = self.OCRB(inputs,positions)
-            gene_embedding=torch.squeeze(output[:,gene_pos,:], dim=1)
-            # gene_embedding=output[:,gene_pos,:]
-            outputs.append(gene_embedding)
-        return torch.cat(outputs, dim=0) 
+
 
 
     def test_result(self):
@@ -299,13 +332,6 @@ class OCRBTrainer:
     def train_result(self):
         return self.get_results(self.train_data)
     
-    # @torch.no_grad()
-    # def get_attention(self, data_loader: DataLoader):
-    #     attn_weights = []
-    #     for batch in tqdm(data_loader):
-    #         _, attn = self.model.ocrb(torch.squeeze(batch['ocrb_input'], dim=1).to(self.device))
-    #         attn_weights.append(attn.cpu())
-    #     return torch.cat(attn_weights, dim=0)
     
     # @torch.no_grad()
     # def get_w_embed(self, data_loader: DataLoader,gene_pos,positions):
